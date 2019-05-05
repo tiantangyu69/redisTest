@@ -1,0 +1,231 @@
+@Service
+public class DistributedLockCacheService {
+    private static final Logger LOGGER = LoggerFactory.getLogger(DistributedLockCacheService.class);
+    /**
+     * redis cluster template
+     */
+    @Resource(name = "stringRedisTemplate")
+    private StringRedisTemplate redisTemplate;
+
+    private ValueOperations<String, String> opsForValue() {
+        return redisTemplate.opsForValue();
+    }
+
+    /**
+     * 默认等待获取锁超时时间（毫秒），这里为10000毫秒，即10秒
+     */
+    private static final long DEFAULT_WAIT_TIME = 10000;
+
+    /**
+     * 锁失效时间（毫秒），过期删除，这里为60秒
+     */
+    private static final int LOCK_EXPIRE_TIME = 60;
+
+    /**
+     * 尝试获取锁,不管是否获取到锁立即返回获取状态
+     *
+     * @param lockKey
+     * @return boolean
+     */
+    public boolean tryLock(String lockKey) {
+        // 锁默认失效时间60秒
+        return tryLock(lockKey, LOCK_EXPIRE_TIME);
+    }
+
+    /**
+     * 尝试获取锁,不管是否获取到锁立即返回获取状态
+     *
+     * @param lockKey
+     * @return boolean
+     */
+    public boolean tryLock(String lockKey, int seconds) {
+        try {
+            return doGetLock(lockKey, getLockExpireTimeStr(seconds));
+        } catch (Exception e) {
+            LOGGER.error("tryLock error, cause: " + e.getMessage());
+            unlock(lockKey);// 出异常时删除缓存key
+            return false;
+        }
+    }
+
+    /**
+     * 尝试获取锁，若获取到锁则执行业务逻辑返回 true，未获取到锁不执行业务逻辑并返回 false
+     *
+     * @param lockKey
+     * @param lockExecutor
+     * @return
+     */
+    public <T> T tryInLock(String lockKey, LockExecutor<T> lockExecutor) {
+        return tryInLock(lockKey, LOCK_EXPIRE_TIME, lockExecutor);
+    }
+
+    /**
+     * 尝试获取锁，若获取到锁则执行业务逻辑，未获取到锁不执行业务逻辑
+     *
+     * @param lockKey
+     * @param seconds
+     * @param lockExecutor
+     * @return
+     */
+    public <T> T tryInLock(String lockKey, int seconds, LockExecutor<T> lockExecutor) {
+        try {
+            if (doGetLock(lockKey, getLockExpireTimeStr(seconds))) {
+                try {
+                    return lockExecutor.execute();
+                } catch (Exception e) {
+                    LOGGER.error("tryLock error, cause: " + e);
+                    throw e;
+                } finally {
+                    unlock(lockKey);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("tryLock error, cause: " + e.getMessage());
+            unlock(lockKey);// 出异常时删除缓存key
+        }
+
+        return null;
+    }
+
+    /**
+     * 循环获取锁，使用默认的获取锁超时时间 10秒
+     *
+     * @param lockKey 锁名称
+     */
+    public void lock(String lockKey) {
+        lock(lockKey, DEFAULT_WAIT_TIME, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 循环获取锁，直到超时
+     *
+     * @param lockKey
+     * @param waitTime 超时时间
+     * @param timeUnit 超时时间单位
+     */
+    public void lock(String lockKey, long waitTime, TimeUnit timeUnit) {
+        try {
+            long currentNanoTime = System.nanoTime();
+            long waitTimeoutNano = timeUnit.toNanos(waitTime);// 获取锁等待超时时间默认10秒
+
+            // 锁失效时间60秒
+            String lockExpireTimeStr = getLockExpireTimeStr();
+
+            while ((System.nanoTime() - currentNanoTime) < waitTimeoutNano) {// 未获取到则重试
+                if (doGetLock(lockKey, lockExpireTimeStr)) {// 获取到锁
+                    return;
+                } else {
+                    Thread.sleep(10);//未获取到锁短暂休眠，并继续尝试获取锁
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("lock error, cause: " + e.getMessage());
+            unlock(lockKey);
+            throw new RuntimeException(String.format("get lock %s failed", lockKey));
+        }
+        //已超出加锁的最长等待时间
+        throw new RuntimeException(String.format("get lock %s time out", lockKey));
+    }
+
+    /**
+     * 获取锁失效时间字符串，失效时间为当前时间加60秒
+     *
+     * @return
+     */
+    private String getLockExpireTimeStr() {
+        return getLockExpireTimeStr(LOCK_EXPIRE_TIME);
+    }
+
+    /**
+     * 获取锁失效时间字符串，失效时间为当前时间加60秒
+     *
+     * @return
+     */
+    private String getLockExpireTimeStr(int seconds) {
+        return String.valueOf(System.currentTimeMillis() + (seconds * 1000));
+    }
+
+    /**
+     * 执行获取锁操作
+     *
+     * @param lockKey
+     * @param lockExpireTimeStr
+     * @return
+     */
+    private boolean doGetLock(String lockKey, String lockExpireTimeStr) {
+        ValueOperations<String, String> valueOperations = opsForValue();
+
+        Boolean setNxResult = valueOperations.setIfAbsent(lockKey, lockExpireTimeStr);
+        if (setNxResult) {// 获取到锁
+            redisTemplate.expire(lockKey, LOCK_EXPIRE_TIME, TimeUnit.SECONDS);// 设置锁失效时间60秒
+            return true;
+        }
+
+        String currentLockExpireTimeStr = valueOperations.get(lockKey);// 获取缓存中设置的锁的过期时间
+        // 检查锁是否过期，这里主要是防止setNx命令执行后redis崩溃未执行expire操作造成死锁
+        if (null != currentLockExpireTimeStr && Long.parseLong(currentLockExpireTimeStr) < System.currentTimeMillis()) {
+            String oldValue = valueOperations.getAndSet(lockKey, lockExpireTimeStr);// 获取设置缓存之前的时间戳
+            // 防止锁过期后，多个线程并发获取到锁，通过对比获取的时间戳和设置时的时间戳是否相同判断是否当前线程获取到锁
+            if (null != oldValue && oldValue.equals(currentLockExpireTimeStr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 释放锁
+     *
+     * @param lockKey
+     */
+    public void unlock(String lockKey) {
+        try {
+            redisTemplate.delete(lockKey);
+        } catch (Exception e) {
+            LOGGER.error("unlock error, cause: ", e);
+        }
+    }
+
+
+    /**
+     * 在redis锁中执行业务逻辑
+     *
+     * @param lockKey
+     */
+    public <T> T doInLock(String lockKey, LockExecutor<T> executor) {
+        return doInLock(lockKey, DEFAULT_WAIT_TIME, TimeUnit.MILLISECONDS, executor);
+    }
+
+    /**
+     * 在redis锁中执行业务逻辑
+     *
+     * @param lockKey
+     * @param waitTime
+     * @param timeUnit
+     */
+    public <T> T doInLock(String lockKey, long waitTime, TimeUnit timeUnit, LockExecutor<T> executor) {
+        try {
+            T result;
+            lock(lockKey, waitTime, timeUnit);
+            try {
+                result = executor.execute();
+            } catch (Exception e) {
+                LOGGER.error("doInLock error, cause: " + e);
+                unlock(lockKey);
+                throw e;
+            }
+            unlock(lockKey);
+            return result;
+        } catch (Exception e) {
+            LOGGER.error("doInLock error, cause: " + e);
+            throw new RuntimeException("doInLock error, cause: " + e);
+        }
+    }
+
+    /**
+     * 获取锁之后的业务逻辑执行器，用于执行代码逻辑
+     */
+    public interface LockExecutor<T> {
+        T execute();
+    }
+}
